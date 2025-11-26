@@ -2,7 +2,9 @@ package server_test
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -147,5 +149,115 @@ func TestEchoServer_HandlesMultipleClients(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("client %d failed: %v", res.id, res.err)
 		}
+	}
+}
+
+func TestHandleConn_EchoesDataUntilEOF(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	done := make(chan struct{})
+	var totalBytes int64
+	var handleErr error
+
+	go func() {
+		defer close(done)
+		totalBytes, handleErr = HandleConn(serverSide)
+	}()
+
+	payload := []byte("hello\nworld\n")
+
+	// Write the payload to the server.
+	if _, err := clientSide.Write(payload); err != nil {
+		t.Fatalf("client write failed: %v", err)
+	}
+
+	// Read the echoed payload back.
+	echoed := make([]byte, len(payload))
+	if _, err := io.ReadFull(clientSide, echoed); err != nil {
+		t.Fatalf("client read failed: %v", err)
+	}
+
+	if string(echoed) != string(payload) {
+		t.Fatalf("expected echoed %q, got %q", string(payload), string(echoed))
+	}
+
+	// Close client to signal EOF to the server side.
+	if err := clientSide.Close(); err != nil {
+		t.Fatalf("client close failed: %v", err)
+	}
+
+	// Wait for HandleConn to finish, but don't hang forever.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HandleConn did not return after client closed")
+	}
+
+	if handleErr != nil {
+		t.Fatalf("expected nil error on normal EOF shutdown, got: %v", handleErr)
+	}
+
+	if totalBytes != int64(len(payload)) {
+		t.Fatalf("expected totalBytes=%d, got %d", len(payload), totalBytes)
+	}
+}
+
+func TestHandleConn_TreatsEOFAsNormalShutdown(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+
+	done := make(chan struct{})
+	var handleErr error
+
+	go func() {
+		defer close(done)
+		_, handleErr = HandleConn(serverSide)
+	}()
+
+	// Immediately close client; server should see EOF and exit cleanly.
+	if err := clientSide.Close(); err != nil {
+		t.Fatalf("client close failed: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("HandleConn did not return after EOF")
+	}
+
+	if handleErr != nil {
+		t.Fatalf("expected nil error on EOF, got: %v", handleErr)
+	}
+}
+
+// errorConn is a test double for net.Conn that always returns a non-EOF error on Read.
+type errorConn struct{}
+
+var errTestRead = errors.New("test read error")
+
+func (e *errorConn) Read(p []byte) (int, error)       { return 0, errTestRead }
+func (e *errorConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (e *errorConn) Close() error                     { return nil }
+func (e *errorConn) LocalAddr() net.Addr              { return dummyAddr("local") }
+func (e *errorConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
+func (e *errorConn) SetDeadline(time.Time) error      { return nil }
+func (e *errorConn) SetReadDeadline(time.Time) error  { return nil }
+func (e *errorConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyAddr string
+
+func (d dummyAddr) Network() string { return "test" }
+func (d dummyAddr) String() string  { return string(d) }
+
+func TestHandleConn_PropagatesNonEOFError(t *testing.T) {
+	conn := &errorConn{}
+
+	_, err := HandleConn(conn)
+	if err == nil {
+		t.Fatalf("expected non-nil error, got nil")
+	}
+
+	if !errors.Is(err, errTestRead) {
+		t.Fatalf("expected error to wrap %v, got %v", errTestRead, err)
 	}
 }

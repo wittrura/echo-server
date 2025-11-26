@@ -23,37 +23,15 @@ func RunEchoServer(addr string) (net.Listener, error) {
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					fmt.Println("Connection was closed")
-					continue
+					return
 				}
 				log.Fatal(err)
 			}
 
-			go handleWithBufio(conn)
+			go HandleConn(conn)
 		}
 	}()
 	return l, nil
-}
-
-func handleWithBufio(conn net.Conn) {
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-
-	for {
-		bytes, err := reader.ReadBytes(byte('\n'))
-		if err != nil {
-			if err != io.EOF {
-				fmt.Println("failed to read data, err:", err)
-			}
-			return
-		}
-
-		_, err = conn.Write(bytes)
-		if err != nil {
-			fmt.Println("failed to write data, err:", err)
-			return
-		}
-	}
 }
 
 func handleWithExplicitRead(conn net.Conn) {
@@ -80,6 +58,33 @@ func handleWithExplicitRead(conn net.Conn) {
 		if err != nil {
 			fmt.Printf("Error writing to connection: %v\n", err)
 			return
+		}
+	}
+}
+
+// HandleConn reads from conn, echoes data back to the peer,
+// and returns the total number of bytes echoed.
+// EOF is treated as a normal shutdown and should not be returned as an error.
+func HandleConn(conn net.Conn) (int64, error) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	var bytesEchoed int64
+	for {
+		bytes, err := reader.ReadBytes(byte('\n'))
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("failed to read data, err:", err)
+				return bytesEchoed, err
+			}
+			return bytesEchoed, nil
+		}
+
+		n, err := conn.Write(bytes)
+		bytesEchoed += int64(n)
+		if err != nil {
+			fmt.Println("failed to write data, err:", err)
+			return bytesEchoed, nil
 		}
 	}
 }
