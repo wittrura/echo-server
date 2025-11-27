@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -162,7 +163,7 @@ func TestHandleConn_EchoesDataUntilEOF(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		totalBytes, handleErr = HandleConn(serverSide)
+		totalBytes, handleErr = HandleConn(serverSide, nil)
 	}()
 
 	payload := []byte("hello\nworld\n")
@@ -211,7 +212,7 @@ func TestHandleConn_TreatsEOFAsNormalShutdown(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		_, handleErr = HandleConn(serverSide)
+		_, handleErr = HandleConn(serverSide, nil)
 	}()
 
 	// Immediately close client; server should see EOF and exit cleanly.
@@ -252,12 +253,119 @@ func (d dummyAddr) String() string  { return string(d) }
 func TestHandleConn_PropagatesNonEOFError(t *testing.T) {
 	conn := &errorConn{}
 
-	_, err := HandleConn(conn)
+	_, err := HandleConn(conn, nil)
 	if err == nil {
 		t.Fatalf("expected non-nil error, got nil")
 	}
 
 	if !errors.Is(err, errTestRead) {
 		t.Fatalf("expected error to wrap %v, got %v", errTestRead, err)
+	}
+}
+
+// helper: dial with custom timeout
+func dialWithTimeout(t *testing.T, addr string, timeout time.Duration) net.Conn {
+	t.Helper()
+
+	dialer := net.Dialer{
+		Timeout: timeout,
+	}
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("failed to dial server %s: %v", addr, err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatalf("failed to set deadline: %v", err)
+	}
+	return conn
+}
+
+func TestRunEchoServerWithContext_ShutsDownOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, done, err := RunEchoServerWithContext(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("RunEchoServerWithContext failed: %v", err)
+	}
+
+	// Verify it works before cancel.
+	conn := dialWithTimeout(t, addr.String(), 2*time.Second)
+	reader := bufio.NewReader(conn)
+
+	msg := "before-cancel\n"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("failed to write before cancel: %v", err)
+	}
+
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read echo before cancel: %v", err)
+	}
+	if resp != msg {
+		t.Fatalf("expected %q before cancel, got %q", msg, resp)
+	}
+	_ = conn.Close()
+
+	// Trigger shutdown.
+	cancel()
+
+	// Server should complete shutdown (stop accepting + finish handlers) within timeout.
+	select {
+	case <-done:
+		// ok
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server did not shut down within timeout after context cancel")
+	}
+
+	// After shutdown, new connections should fail to establish.
+	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
+	if _, err := dialer.Dial("tcp", addr.String()); err == nil {
+		t.Fatalf("expected dialing after shutdown to fail, but it succeeded")
+	}
+}
+
+func TestRunEchoServerWithContext_AllowsInFlightConnAfterCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, done, err := RunEchoServerWithContext(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("RunEchoServerWithContext failed: %v", err)
+	}
+
+	// Open a connection before cancel.
+	conn := dialWithTimeout(t, addr.String(), 2*time.Second)
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Cancel context to initiate shutdown of accept loop.
+	cancel()
+
+	// In-flight connection should still be usable briefly after cancel.
+	msg := "after-cancel-still-works\n"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("failed to write on in-flight conn after cancel: %v", err)
+	}
+
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read echo on in-flight conn after cancel: %v", err)
+	}
+	if resp != msg {
+		t.Fatalf("expected %q on in-flight conn, got %q", msg, resp)
+	}
+
+	// Close the in-flight connection so the server can fully shut down.
+	if err := conn.Close(); err != nil {
+		t.Fatalf("failed to close in-flight conn: %v", err)
+	}
+
+	// Server should finish shutdown once active connections are done.
+	select {
+	case <-done:
+		// ok
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server did not shut down after in-flight connection completed")
 	}
 }
