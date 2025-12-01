@@ -101,65 +101,16 @@ func HandleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error) {
 // It returns the bound address (which may be different if you pass ":0")
 // and a channel that's closed when shutdown is complete.
 func RunEchoServerWithContext(ctx context.Context, addr string) (net.Addr, <-chan struct{}, error) {
-	return RunEchoServerWithLimits(ctx, addr, 1000)
+	server := NewEchoServer(addr, 1000)
+	address, err := server.Start(ctx)
+	return address, server.done, err
 }
 
 // RunEchoServerWithLimits starts an echo server with a max active-connection limit.
 func RunEchoServerWithLimits(ctx context.Context, addr string, maxConns int) (net.Addr, <-chan struct{}, error) {
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	done := make(chan struct{})
-
-	var wg sync.WaitGroup
-	go func() {
-		<-ctx.Done()
-		fmt.Println("received ctx.Done")
-
-		_ = l.Close()
-		fmt.Println("closed listener")
-
-		wg.Wait()
-		fmt.Println("waited for connections to finish")
-
-		close(done)
-		fmt.Println("closed done channel to notify client")
-	}()
-
-	go func(maxConns int) {
-		var activeConnections int32
-
-		for {
-			conn, err := l.Accept()
-
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					fmt.Println("Connection was closed")
-					return
-				}
-				log.Fatal(err)
-				return
-			}
-
-			if activeConnections < int32(maxConns) {
-				atomic.AddInt32(&activeConnections, 1)
-				wg.Add(1)
-				go func() {
-					defer func() {
-						atomic.AddInt32(&activeConnections, -1)
-					}()
-					HandleConn(conn, &wg)
-				}()
-			} else {
-				_, _ = conn.Write([]byte("server busy, try again later\n"))
-				conn.Close()
-			}
-		}
-	}(maxConns)
-
-	return l.Addr(), done, nil
+	server := NewEchoServer(addr, maxConns)
+	address, err := server.Start(ctx)
+	return address, server.done, err
 }
 
 type EchoServer struct {
