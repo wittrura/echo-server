@@ -369,3 +369,122 @@ func TestRunEchoServerWithContext_AllowsInFlightConnAfterCancel(t *testing.T) {
 		t.Fatalf("server did not shut down after in-flight connection completed")
 	}
 }
+
+func TestRunEchoServerWithLimits_AllowsUpToMaxActiveConnections(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const maxConns = 3
+
+	addr, done, err := RunEchoServerWithLimits(ctx, "127.0.0.1:0", maxConns)
+	if err != nil {
+		t.Fatalf("RunEchoServerWithLimits failed: %v", err)
+	}
+
+	var conns []net.Conn
+	for range maxConns {
+		conn := dialWithTimeout(t, addr.String(), 2*time.Second)
+		conns = append(conns, conn)
+	}
+
+	// Each active connection should behave like a normal echo connection.
+	for _, conn := range conns {
+		reader := bufio.NewReader(conn)
+		msg := "hello-through-limited-server\n"
+
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("failed to write on limited server connection: %v", err)
+		}
+
+		resp, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed to read echo on limited server connection: %v", err)
+		}
+		if resp != msg {
+			t.Fatalf("expected %q, got %q", msg, resp)
+		}
+	}
+
+	// Cleanup: close connections and shut down server.
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server did not shut down after cancel in max-conn test")
+	}
+}
+
+const busyMessage = "server busy, try again later\n"
+
+func TestRunEchoServerWithLimits_RejectsConnectionsBeyondLimit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const maxConns = 2
+
+	addr, done, err := RunEchoServerWithLimits(ctx, "127.0.0.1:0", maxConns)
+	if err != nil {
+		t.Fatalf("RunEchoServerWithLimits failed: %v", err)
+	}
+
+	// Open maxConns connections and keep them open.
+	var conns []net.Conn
+	for range maxConns {
+		conn := dialWithTimeout(t, addr.String(), 2*time.Second)
+		conns = append(conns, conn)
+	}
+
+	// Now attempt one extra connection; it should be explicitly rejected.
+	rejectedConn := dialWithTimeout(t, addr.String(), 2*time.Second)
+	rejectedReader := bufio.NewReader(rejectedConn)
+
+	line, err := rejectedReader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("expected to read rejection message, got error: %v", err)
+	}
+	if line != busyMessage {
+		t.Fatalf("expected busy message %q, got %q", busyMessage, line)
+	}
+
+	// After rejection message, the server should close the connection.
+	_, err = rejectedReader.ReadString('\n')
+	if err == nil {
+		t.Fatalf("expected connection to be closed after busy message")
+	}
+	_ = rejectedConn.Close()
+
+	// If we now close one existing connection, we should be able to open another "normal" one.
+	_ = conns[0].Close()
+
+	newConn := dialWithTimeout(t, addr.String(), 2*time.Second)
+	defer newConn.Close()
+
+	reader := bufio.NewReader(newConn)
+	msg := "allowed-after-slot-freed\n"
+	if _, err := newConn.Write([]byte(msg)); err != nil {
+		t.Fatalf("failed to write on new connection after freeing slot: %v", err)
+	}
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read echo on new connection: %v", err)
+	}
+	if resp != msg {
+		t.Fatalf("expected %q on new connection, got %q", msg, resp)
+	}
+
+	// Cleanup.
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	newConn.Close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server did not shut down in rejection test")
+	}
+}

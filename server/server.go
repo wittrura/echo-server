@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 // RunEchoServer starts a TCP echo server listening on addr.
@@ -137,6 +138,64 @@ func RunEchoServerWithContext(ctx context.Context, addr string) (net.Addr, <-cha
 			go HandleConn(conn, &wg)
 		}
 	}()
+
+	return l.Addr(), done, nil
+}
+
+// RunEchoServerWithLimits starts an echo server with a max active-connection limit.
+func RunEchoServerWithLimits(ctx context.Context, addr string, maxConns int) (net.Addr, <-chan struct{}, error) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	done := make(chan struct{})
+
+	var wg sync.WaitGroup
+	go func() {
+		<-ctx.Done()
+		fmt.Println("received ctx.Done")
+
+		_ = l.Close()
+		fmt.Println("closed listener")
+
+		wg.Wait()
+		fmt.Println("waited for connections to finish")
+
+		close(done)
+		fmt.Println("closed done channel to notify client")
+	}()
+
+	go func(maxConns int) {
+		var activeConnections int32
+
+		for {
+			conn, err := l.Accept()
+
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					fmt.Println("Connection was closed")
+					return
+				}
+				log.Fatal(err)
+				return
+			}
+
+			if activeConnections < int32(maxConns) {
+				atomic.AddInt32(&activeConnections, 1)
+				wg.Add(1)
+				go func() {
+					defer func() {
+						atomic.AddInt32(&activeConnections, -1)
+					}()
+					HandleConn(conn, &wg)
+				}()
+			} else {
+				_, _ = conn.Write([]byte("server busy, try again later\n"))
+				conn.Close()
+			}
+		}
+	}(maxConns)
 
 	return l.Addr(), done, nil
 }
