@@ -161,3 +161,131 @@ func RunEchoServerWithLimits(ctx context.Context, addr string, maxConns int) (ne
 
 	return l.Addr(), done, nil
 }
+
+type EchoServer struct {
+	addr     string
+	ln       net.Listener
+	maxConns int
+
+	wg    sync.WaitGroup
+	mu    sync.Mutex
+	stats Stats
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	done chan struct{}
+}
+
+func NewEchoServer(addr string, maxConns int) *EchoServer {
+	return &EchoServer{
+		addr:     addr,
+		maxConns: maxConns,
+		done:     make(chan struct{}),
+	}
+}
+
+func (s *EchoServer) Start(ctx context.Context) (net.Addr, error) {
+	s.ctx, s.cancel = context.WithCancel(ctx)
+
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return nil, err
+	}
+	s.ln = ln
+
+	go s.acceptLoop()
+	go s.shutdownWatcher()
+
+	return ln.Addr(), nil
+}
+
+func (s *EchoServer) acceptLoop() {
+	var activeConnections int32
+
+	for {
+		conn, err := s.ln.Accept()
+
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				fmt.Println("Connection was closed")
+				return
+			}
+			log.Fatal(err)
+			return
+		}
+
+		if activeConnections < int32(s.maxConns) {
+			atomic.AddInt32(&activeConnections, 1)
+			s.wg.Add(1)
+			go func() {
+				defer func() {
+					atomic.AddInt32(&activeConnections, -1)
+				}()
+				bytes, _ := HandleConn(conn, &s.wg)
+				s.handleConn(conn.RemoteAddr().String(), bytes)
+			}()
+		} else {
+			_, _ = conn.Write([]byte("server busy, try again later\n"))
+			conn.Close()
+			s.rejectConn()
+		}
+	}
+}
+
+func (s *EchoServer) shutdownWatcher() {
+	<-s.ctx.Done()
+	fmt.Println("received ctx.Done")
+
+	_ = s.ln.Close()
+	fmt.Println("closed listener")
+
+	s.wg.Wait()
+	fmt.Println("waited for connections to finish")
+
+	close(s.done)
+	fmt.Println("closed done channel to notify client")
+}
+
+func (s *EchoServer) Done() <-chan struct{} {
+	return s.done
+}
+
+func (s *EchoServer) Stats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats // return by value (safe)
+}
+
+func (s *EchoServer) handleConn(addr string, bytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stats.TotalConnections++
+	s.stats.TotalBytesEchoed += bytes
+	s.stats.Connections = append(s.stats.Connections, ConnStats{
+		RemoteAddr:  addr,
+		BytesEchoed: bytes,
+	})
+}
+
+func (s *EchoServer) rejectConn() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.stats.TotalRejected++
+}
+
+// ConnStats represents stats for a single connection.
+type ConnStats struct {
+	RemoteAddr  string
+	BytesEchoed int64
+}
+
+// Stats represents global server stats.
+type Stats struct {
+	TotalConnections int64
+	TotalBytesEchoed int64
+	TotalRejected    int64
+	Connections      []ConnStats
+}
