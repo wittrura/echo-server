@@ -75,23 +75,23 @@ func HandleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	var bytesEchoed int64
+	var totalBytesEchoed int64
 	for {
 		bytes, err := reader.ReadBytes(byte('\n'))
 		if err != nil {
 			if err != io.EOF {
 				fmt.Println("failed to read data, err:", err)
-				return bytesEchoed, err
+				return totalBytesEchoed, err
 			}
-			return bytesEchoed, nil
+			return totalBytesEchoed, nil
 		}
 
-		n, err := conn.Write(bytes)
-		bytesEchoed += int64(n)
+		bytesEchoed, err := conn.Write(bytes)
 		if err != nil {
 			fmt.Println("failed to write data, err:", err)
-			return bytesEchoed, err
+			return totalBytesEchoed, err
 		}
+		totalBytesEchoed += int64(bytesEchoed)
 	}
 }
 
