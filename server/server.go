@@ -10,6 +10,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // RunEchoServer starts a TCP echo server listening on addr.
@@ -31,7 +32,7 @@ func RunEchoServer(addr string) (net.Listener, error) {
 				log.Fatal(err)
 			}
 
-			go HandleConn(conn, nil)
+			go HandleConn(conn, nil, time.Duration(0))
 		}
 	}()
 	return l, nil
@@ -68,7 +69,7 @@ func handleWithExplicitRead(conn net.Conn) {
 // HandleConn reads from conn, echoes data back to the peer,
 // and returns the total number of bytes echoed.
 // EOF is treated as a normal shutdown and should not be returned as an error.
-func HandleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error) {
+func HandleConn(conn net.Conn, wg *sync.WaitGroup, readTimeout time.Duration) (int64, error) {
 	if wg != nil {
 		defer wg.Done()
 	}
@@ -76,7 +77,13 @@ func HandleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error) {
 
 	reader := bufio.NewReader(conn)
 	var totalBytesEchoed int64
+
 	for {
+		var readDeadline time.Time
+		if readTimeout != 0 {
+			readDeadline = time.Now().Add(readTimeout)
+		}
+		conn.SetReadDeadline(readDeadline)
 		bytes, err := reader.ReadBytes(byte('\n'))
 		if err != nil {
 			if err != io.EOF {
@@ -122,8 +129,9 @@ type EchoServer struct {
 	mu    sync.Mutex
 	stats Stats
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx         context.Context
+	cancel      context.CancelFunc
+	readTimeout time.Duration
 
 	done chan struct{}
 }
@@ -173,7 +181,7 @@ func (s *EchoServer) acceptLoop() {
 				defer func() {
 					atomic.AddInt32(&activeConnections, -1)
 				}()
-				bytes, _ := HandleConn(conn, &s.wg)
+				bytes, _ := HandleConn(conn, &s.wg, s.readTimeout)
 				s.handleConn(conn.RemoteAddr().String(), bytes)
 			}()
 		} else {
@@ -196,6 +204,10 @@ func (s *EchoServer) shutdownWatcher() {
 
 	close(s.done)
 	fmt.Println("closed done channel to notify client")
+}
+
+func (s *EchoServer) SetReadTimeout(d time.Duration) {
+	s.readTimeout = d
 }
 
 func (s *EchoServer) Done() <-chan struct{} {

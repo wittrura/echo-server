@@ -163,7 +163,7 @@ func TestHandleConn_EchoesDataUntilEOF(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		totalBytes, handleErr = HandleConn(serverSide, nil)
+		totalBytes, handleErr = HandleConn(serverSide, nil, time.Duration(0))
 	}()
 
 	payload := []byte("hello\nworld\n")
@@ -212,7 +212,7 @@ func TestHandleConn_TreatsEOFAsNormalShutdown(t *testing.T) {
 
 	go func() {
 		defer close(done)
-		_, handleErr = HandleConn(serverSide, nil)
+		_, handleErr = HandleConn(serverSide, nil, time.Duration(0))
 	}()
 
 	// Immediately close client; server should see EOF and exit cleanly.
@@ -253,7 +253,7 @@ func (d dummyAddr) String() string  { return string(d) }
 func TestHandleConn_PropagatesNonEOFError(t *testing.T) {
 	conn := &errorConn{}
 
-	_, err := HandleConn(conn, nil)
+	_, err := HandleConn(conn, nil, time.Duration(0))
 	if err == nil {
 		t.Fatalf("expected non-nil error, got nil")
 	}
@@ -487,4 +487,120 @@ func TestRunEchoServerWithLimits_RejectsConnectionsBeyondLimit(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatalf("server did not shut down in rejection test")
 	}
+}
+
+// Helper: small timeout dialer
+func dialShort(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+	return conn
+}
+
+func TestEchoServer_ReadTimeout_AllowsNormalConnections(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := NewEchoServer("127.0.0.1:0", 10)
+	srv.SetReadTimeout(200 * time.Millisecond) // short but workable
+
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	conn := dialShort(t, addr.String())
+	reader := bufio.NewReader(conn)
+
+	msg := "hello\n"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	resp, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+
+	if resp != msg {
+		t.Fatalf("expected %q, got %q", msg, resp)
+	}
+
+	_ = conn.Close()
+
+	cancel()
+	<-srv.Done()
+}
+
+func TestEchoServer_ReadTimeout_IdleClientIsDisconnected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := NewEchoServer("127.0.0.1:0", 10)
+	srv.SetReadTimeout(150 * time.Millisecond)
+
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	conn := dialShort(t, addr.String())
+	defer conn.Close()
+
+	// Do not send anything.
+	// Just wait longer than the timeout.
+	time.Sleep(300 * time.Millisecond)
+
+	// The connection should be closed by the server due to timeout.
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("expected idle connection to be closed by server, but read %d bytes", n)
+	}
+
+	// Shutdown
+	cancel()
+	<-srv.Done()
+}
+
+func TestEchoServer_ReadTimeout_PartialActivityStillTimeouts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := NewEchoServer("127.0.0.1:0", 10)
+	srv.SetReadTimeout(150 * time.Millisecond)
+
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start: %v", err)
+	}
+
+	conn := dialShort(t, addr.String())
+	defer conn.Close()
+
+	// Send one line.
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// Read echo.
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadString('\n'); err != nil {
+		t.Fatalf("read echo failed: %v", err)
+	}
+
+	// Now go idle past timeout.
+	time.Sleep(300 * time.Millisecond)
+
+	// Expect server to close connection.
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("expected timeout disconnect; got %d bytes instead", n)
+	}
+
+	cancel()
+	<-srv.Done()
 }
