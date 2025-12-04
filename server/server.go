@@ -15,27 +15,10 @@ import (
 
 // RunEchoServer starts a TCP echo server listening on addr.
 // It returns the net.Listener so callers can close it to stop the server.
-func RunEchoServer(addr string) (net.Listener, error) {
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
-					fmt.Println("Connection was closed")
-					return
-				}
-				log.Fatal(err)
-			}
-
-			go HandleConn(conn, nil, time.Duration(0))
-		}
-	}()
-	return l, nil
+func RunEchoServer(addr string) (net.Addr, <-chan struct{}, error) {
+	server := NewEchoServer(addr, 1000)
+	address, err := server.Start(context.Background())
+	return address, server.done, err
 }
 
 func handleWithExplicitRead(conn net.Conn) {
@@ -63,42 +46,6 @@ func handleWithExplicitRead(conn net.Conn) {
 			fmt.Printf("Error writing to connection: %v\n", err)
 			return
 		}
-	}
-}
-
-// HandleConn reads from conn, echoes data back to the peer,
-// and returns the total number of bytes echoed.
-// EOF is treated as a normal shutdown and should not be returned as an error.
-func HandleConn(conn net.Conn, wg *sync.WaitGroup, readTimeout time.Duration) (int64, error) {
-	if wg != nil {
-		defer wg.Done()
-	}
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-	var totalBytesEchoed int64
-
-	for {
-		var readDeadline time.Time
-		if readTimeout != 0 {
-			readDeadline = time.Now().Add(readTimeout)
-		}
-		conn.SetReadDeadline(readDeadline)
-		bytes, err := reader.ReadBytes(byte('\n'))
-		if err != nil {
-			if err != io.EOF {
-				fmt.Println("failed to read data, err:", err)
-				return totalBytesEchoed, err
-			}
-			return totalBytesEchoed, nil
-		}
-
-		bytesEchoed, err := conn.Write(bytes)
-		if err != nil {
-			fmt.Println("failed to write data, err:", err)
-			return totalBytesEchoed, err
-		}
-		totalBytesEchoed += int64(bytesEchoed)
 	}
 }
 
@@ -181,14 +128,50 @@ func (s *EchoServer) acceptLoop() {
 				defer func() {
 					atomic.AddInt32(&activeConnections, -1)
 				}()
-				bytes, _ := HandleConn(conn, &s.wg, s.readTimeout)
-				s.handleConn(conn.RemoteAddr().String(), bytes)
+				bytes, _ := s.handleConn(conn, &s.wg)
+				s.handleConnStats(conn.RemoteAddr().String(), bytes)
 			}()
 		} else {
 			_, _ = conn.Write([]byte("server busy, try again later\n"))
 			conn.Close()
-			s.rejectConn()
+			s.rejectConnStats()
 		}
+	}
+}
+
+// handleConn reads from conn, echoes data back to the peer,
+// and returns the total number of bytes echoed.
+// EOF is treated as a normal shutdown and should not be returned as an error.
+func (s *EchoServer) handleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error) {
+	if wg != nil {
+		defer wg.Done()
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	var totalBytesEchoed int64
+
+	for {
+		var readDeadline time.Time
+		if s.readTimeout != 0 {
+			readDeadline = time.Now().Add(s.readTimeout)
+		}
+		conn.SetReadDeadline(readDeadline)
+		bytes, err := reader.ReadBytes(byte('\n'))
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("failed to read data, err:", err)
+				return totalBytesEchoed, err
+			}
+			return totalBytesEchoed, nil
+		}
+
+		bytesEchoed, err := conn.Write(bytes)
+		if err != nil {
+			fmt.Println("failed to write data, err:", err)
+			return totalBytesEchoed, err
+		}
+		totalBytesEchoed += int64(bytesEchoed)
 	}
 }
 
@@ -220,7 +203,7 @@ func (s *EchoServer) Stats() Stats {
 	return s.stats // return by value (safe)
 }
 
-func (s *EchoServer) handleConn(addr string, bytes int64) {
+func (s *EchoServer) handleConnStats(addr string, bytes int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -232,7 +215,7 @@ func (s *EchoServer) handleConn(addr string, bytes int64) {
 	})
 }
 
-func (s *EchoServer) rejectConn() {
+func (s *EchoServer) rejectConnStats() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

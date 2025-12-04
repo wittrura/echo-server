@@ -3,9 +3,7 @@ package server_test
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"testing"
 	"time"
@@ -13,253 +11,271 @@ import (
 	. "example.com/echo-server/server"
 )
 
-// helper: start server on an ephemeral port
-func startTestServer(t *testing.T) (addr string, cleanup func()) {
-	t.Helper()
-
-	ln, err := RunEchoServer("127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("RunEchoServer failed: %v", err)
-	}
-
-	// Extract the real address (with chosen port)
-	addr = ln.Addr().String()
-
-	cleanup = func() {
-		_ = ln.Close()
-	}
-
-	return addr, cleanup
-}
-
-// helper: dial with a timeout
-func dialClient(t *testing.T, addr string) net.Conn {
-	t.Helper()
-
-	dialer := net.Dialer{
-		Timeout: 2 * time.Second,
-	}
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("failed to dial server %s: %v", addr, err)
-	}
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	return conn
-}
-
 func TestEchoServer_EchoesSingleMessage(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	conn := dialClient(t, addr)
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	msg := "hello, echo server\n"
-
-	if _, err := conn.Write([]byte(msg)); err != nil {
-		t.Fatalf("failed to write to server: %v", err)
+	tests := []struct {
+		name  string
+		start func(t *testing.T) (addr string, cleanup func())
+	}{
+		{
+			name: "RunEchoServer",
+			start: func(t *testing.T) (string, func()) {
+				addr, _, err := RunEchoServer("127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("RunEchoServer failed: %v", err)
+				}
+				// No cleanup hook for this basic helper; process exit will clean up.
+				return addr.String(), nil
+			},
+		},
+		{
+			name: "RunEchoServerWithContext",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithContext(ctx, "127.0.0.1:0")
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithContext failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in EchoesSingleMessage test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
+		{
+			name: "RunEchoServerWithLimits",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithLimits(ctx, "127.0.0.1:0", 10)
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithLimits failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in EchoesSingleMessage limits test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
 	}
 
-	reader := bufio.NewReader(conn)
-	resp, err := reader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("failed to read echo from server: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, cleanup := tt.start(t)
+			if cleanup != nil {
+				defer cleanup()
+			}
 
-	if resp != msg {
-		t.Fatalf("expected %q, got %q", msg, resp)
-	}
-}
-
-func TestEchoServer_EchoesMultipleMessagesOnSingleConnection(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	conn := dialClient(t, addr)
-	defer conn.Close()
-
-	reader := bufio.NewReader(conn)
-
-	msgs := []string{
-		"first message\n",
-		"second message\n",
-		"third message\n",
-	}
-
-	for _, msg := range msgs {
-		if _, err := conn.Write([]byte(msg)); err != nil {
-			t.Fatalf("failed to write %q to server: %v", msg, err)
-		}
-
-		resp, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatalf("failed to read echo for %q: %v", msg, err)
-		}
-
-		if resp != msg {
-			t.Fatalf("for message %q expected %q, got %q", msg, msg, resp)
-		}
-	}
-}
-
-func TestEchoServer_HandlesMultipleClients(t *testing.T) {
-	addr, cleanup := startTestServer(t)
-	defer cleanup()
-
-	const clientCount = 5
-
-	type result struct {
-		id  int
-		err error
-	}
-
-	results := make(chan result, clientCount)
-
-	for i := range clientCount {
-		go func(id int) {
-			conn := dialClient(t, addr)
+			conn := dialWithTimeout(t, addr, 2*time.Second)
 			defer conn.Close()
 
 			reader := bufio.NewReader(conn)
-			msg := "client-message\n"
-
+			msg := "single-message\n"
 			if _, err := conn.Write([]byte(msg)); err != nil {
-				results <- result{id: id, err: err}
-				return
+				t.Fatalf("failed to write message: %v", err)
 			}
 
 			resp, err := reader.ReadString('\n')
 			if err != nil {
-				results <- result{id: id, err: err}
-				return
+				t.Fatalf("failed to read echo: %v", err)
 			}
-
 			if resp != msg {
-				results <- result{id: id, err: fmt.Errorf("expected %q, got %q", msg, resp)}
-				return
+				t.Fatalf("expected %q, got %q", msg, resp)
+			}
+		})
+	}
+}
+
+func TestEchoServer_EchoesMultipleMessagesOnSingleConnection(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(t *testing.T) (addr string, cleanup func())
+	}{
+		{
+			name: "RunEchoServer",
+			start: func(t *testing.T) (string, func()) {
+				addr, _, err := RunEchoServer("127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("RunEchoServer failed: %v", err)
+				}
+				return addr.String(), nil
+			},
+		},
+		{
+			name: "RunEchoServerWithContext",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithContext(ctx, "127.0.0.1:0")
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithContext failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in MultiMessage test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
+		{
+			name: "RunEchoServerWithLimits",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithLimits(ctx, "127.0.0.1:0", 10)
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithLimits failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in MultiMessage limits test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, cleanup := tt.start(t)
+			if cleanup != nil {
+				defer cleanup()
 			}
 
-			results <- result{id: id, err: nil}
-		}(i)
-	}
+			conn := dialWithTimeout(t, addr, 2*time.Second)
+			defer conn.Close()
 
-	for range clientCount {
-		res := <-results
-		if res.err != nil {
-			t.Fatalf("client %d failed: %v", res.id, res.err)
-		}
-	}
-}
+			reader := bufio.NewReader(conn)
+			messages := []string{"first\n", "second\n", "third\n"}
 
-func TestHandleConn_EchoesDataUntilEOF(t *testing.T) {
-	serverSide, clientSide := net.Pipe()
-	defer clientSide.Close()
+			for _, msg := range messages {
+				if _, err := conn.Write([]byte(msg)); err != nil {
+					t.Fatalf("failed to write message %q: %v", msg, err)
+				}
 
-	done := make(chan struct{})
-	var totalBytes int64
-	var handleErr error
-
-	go func() {
-		defer close(done)
-		totalBytes, handleErr = HandleConn(serverSide, nil, time.Duration(0))
-	}()
-
-	payload := []byte("hello\nworld\n")
-
-	// Write the payload to the server.
-	if _, err := clientSide.Write(payload); err != nil {
-		t.Fatalf("client write failed: %v", err)
-	}
-
-	// Read the echoed payload back.
-	echoed := make([]byte, len(payload))
-	if _, err := io.ReadFull(clientSide, echoed); err != nil {
-		t.Fatalf("client read failed: %v", err)
-	}
-
-	if string(echoed) != string(payload) {
-		t.Fatalf("expected echoed %q, got %q", string(payload), string(echoed))
-	}
-
-	// Close client to signal EOF to the server side.
-	if err := clientSide.Close(); err != nil {
-		t.Fatalf("client close failed: %v", err)
-	}
-
-	// Wait for HandleConn to finish, but don't hang forever.
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("HandleConn did not return after client closed")
-	}
-
-	if handleErr != nil {
-		t.Fatalf("expected nil error on normal EOF shutdown, got: %v", handleErr)
-	}
-
-	if totalBytes != int64(len(payload)) {
-		t.Fatalf("expected totalBytes=%d, got %d", len(payload), totalBytes)
+				resp, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatalf("failed to read echo for %q: %v", msg, err)
+				}
+				if resp != msg {
+					t.Fatalf("expected %q, got %q", msg, resp)
+				}
+			}
+		})
 	}
 }
 
-func TestHandleConn_TreatsEOFAsNormalShutdown(t *testing.T) {
-	serverSide, clientSide := net.Pipe()
-
-	done := make(chan struct{})
-	var handleErr error
-
-	go func() {
-		defer close(done)
-		_, handleErr = HandleConn(serverSide, nil, time.Duration(0))
-	}()
-
-	// Immediately close client; server should see EOF and exit cleanly.
-	if err := clientSide.Close(); err != nil {
-		t.Fatalf("client close failed: %v", err)
+func TestEchoServer_HandlesMultipleClients(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(t *testing.T) (addr string, cleanup func())
+	}{
+		{
+			name: "RunEchoServer",
+			start: func(t *testing.T) (string, func()) {
+				addr, _, err := RunEchoServer("127.0.0.1:0")
+				if err != nil {
+					t.Fatalf("RunEchoServer failed: %v", err)
+				}
+				return addr.String(), nil
+			},
+		},
+		{
+			name: "RunEchoServerWithContext",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithContext(ctx, "127.0.0.1:0")
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithContext failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in MultipleClients test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
+		{
+			name: "RunEchoServerWithLimits",
+			start: func(t *testing.T) (string, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				addr, done, err := RunEchoServerWithLimits(ctx, "127.0.0.1:0", 10)
+				if err != nil {
+					cancel()
+					t.Fatalf("RunEchoServerWithLimits failed: %v", err)
+				}
+				cleanup := func() {
+					cancel()
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						t.Fatalf("server did not shut down in MultipleClients limits test")
+					}
+				}
+				return addr.String(), cleanup
+			},
+		},
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("HandleConn did not return after EOF")
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, cleanup := tt.start(t)
+			if cleanup != nil {
+				defer cleanup()
+			}
 
-	if handleErr != nil {
-		t.Fatalf("expected nil error on EOF, got: %v", handleErr)
-	}
-}
+			// Spin up multiple clients and ensure each can echo independently.
+			const clientCount = 5
+			conns := make([]net.Conn, 0, clientCount)
+			for i := 0; i < clientCount; i++ {
+				conn := dialWithTimeout(t, addr, 2*time.Second)
+				conns = append(conns, conn)
+			}
+			defer func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			}()
 
-// errorConn is a test double for net.Conn that always returns a non-EOF error on Read.
-type errorConn struct{}
+			for i, conn := range conns {
+				reader := bufio.NewReader(conn)
+				msg := fmt.Sprintf("client-%d-message\n", i)
+				if _, err := conn.Write([]byte(msg)); err != nil {
+					t.Fatalf("client %d failed to write: %v", i, err)
+				}
 
-var errTestRead = errors.New("test read error")
-
-func (e *errorConn) Read(p []byte) (int, error)       { return 0, errTestRead }
-func (e *errorConn) Write(p []byte) (int, error)      { return len(p), nil }
-func (e *errorConn) Close() error                     { return nil }
-func (e *errorConn) LocalAddr() net.Addr              { return dummyAddr("local") }
-func (e *errorConn) RemoteAddr() net.Addr             { return dummyAddr("remote") }
-func (e *errorConn) SetDeadline(time.Time) error      { return nil }
-func (e *errorConn) SetReadDeadline(time.Time) error  { return nil }
-func (e *errorConn) SetWriteDeadline(time.Time) error { return nil }
-
-type dummyAddr string
-
-func (d dummyAddr) Network() string { return "test" }
-func (d dummyAddr) String() string  { return string(d) }
-
-func TestHandleConn_PropagatesNonEOFError(t *testing.T) {
-	conn := &errorConn{}
-
-	_, err := HandleConn(conn, nil, time.Duration(0))
-	if err == nil {
-		t.Fatalf("expected non-nil error, got nil")
-	}
-
-	if !errors.Is(err, errTestRead) {
-		t.Fatalf("expected error to wrap %v, got %v", errTestRead, err)
+				resp, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatalf("client %d failed to read echo: %v", i, err)
+				}
+				if resp != msg {
+					t.Fatalf("client %d expected %q, got %q", i, msg, resp)
+				}
+			}
+		})
 	}
 }
 
