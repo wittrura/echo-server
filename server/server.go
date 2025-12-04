@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -166,7 +167,18 @@ func (s *EchoServer) handleConn(conn net.Conn, wg *sync.WaitGroup) (int64, error
 			return totalBytesEchoed, nil
 		}
 
-		bytesEchoed, err := conn.Write(bytes)
+		var response []byte
+		normalized := strings.ToUpper(strings.TrimSpace(string(bytes)))
+		switch normalized {
+		case "STATS":
+			response = fmt.Appendf(nil, "%s\n", s.Stats())
+		case "CLOSE":
+			return totalBytesEchoed, nil
+		default:
+			response = bytes
+		}
+
+		bytesEchoed, err := conn.Write(response)
 		if err != nil {
 			fmt.Println("failed to write data, err:", err)
 			return totalBytesEchoed, err
@@ -234,4 +246,8 @@ type Stats struct {
 	TotalBytesEchoed int64
 	TotalRejected    int64
 	Connections      []ConnStats
+}
+
+func (s Stats) String() string {
+	return fmt.Sprintf("connections=%d, bytes=%d, rejected=%d", s.TotalConnections, s.TotalBytesEchoed, s.TotalRejected)
 }
