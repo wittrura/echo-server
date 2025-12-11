@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"maps"
 	"net"
 	"sync"
 )
@@ -15,7 +15,7 @@ type Server struct {
 	addr string
 
 	ln      net.Listener
-	clients []net.Conn
+	clients map[*Client]bool
 
 	wg sync.WaitGroup
 	mu sync.Mutex
@@ -27,8 +27,9 @@ type Server struct {
 
 func NewServer(addr string) *Server {
 	return &Server{
-		addr: addr,
-		done: make(chan struct{}),
+		addr:    addr,
+		done:    make(chan struct{}),
+		clients: make(map[*Client]bool),
 	}
 }
 
@@ -54,54 +55,63 @@ func (s *Server) acceptLoop() {
 		conn, err := s.ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				fmt.Println("Connection was closed")
+				fmt.Println("listener was closed")
 				return
 			}
-			log.Fatal(err)
+			fmt.Println("accept error:", err)
 			return
 		}
 
 		s.mu.Lock()
-		s.clients = append(s.clients, conn)
+		c := &Client{conn: conn, send: make(chan []byte)}
+		s.clients[c] = true
 		s.mu.Unlock()
 
 		s.wg.Add(1)
 		go func() {
-			_ = s.handleConn(conn, &s.wg)
+			_ = s.handleClient(c, &s.wg)
+		}()
+		go func() {
+			c.write()
 		}()
 	}
 }
 
 // TODO: document
-func (s *Server) handleConn(conn net.Conn, wg *sync.WaitGroup) error {
-	if wg != nil {
-		defer wg.Done()
-	}
-	defer conn.Close()
+func (s *Server) handleClient(c *Client, wg *sync.WaitGroup) error {
+	defer func() {
+		wg.Done()
 
-	reader := bufio.NewReader(conn)
+		c.close()
+
+		s.mu.Lock()
+		delete(s.clients, c)
+		s.mu.Unlock()
+	}()
+
+	reader := bufio.NewReader(c.conn)
 
 	for {
-		bytes, err := reader.ReadBytes(byte('\n'))
+		msg, err := reader.ReadBytes(byte('\n'))
 		if err != nil {
 			if err != io.EOF {
 				fmt.Println("failed to read data, err:", err)
-				return err
 			}
-			return nil
+			if ne, ok := err.(*net.OpError); ok && ne.Err.Error() == "use of closed network connection" {
+				return nil
+			}
+
+			return err
 		}
 
-		// var response []byte
-		// normalized := strings.ToUpper(strings.TrimSpace(string(bytes)))
-		response := bytes
-
-		for _, client := range s.clients {
-			if client != conn {
-				_, err := client.Write(response)
-				if err != nil {
-					fmt.Println("failed to write data, err:", err)
-					return err
-				}
+		clients := make(map[*Client]bool)
+		s.mu.Lock()
+		maps.Copy(clients, s.clients)
+		s.mu.Unlock()
+		for client := range clients {
+			select {
+			case client.send <- msg:
+			default:
 			}
 		}
 	}
@@ -114,11 +124,12 @@ func (s *Server) shutdownWatcher() {
 	_ = s.ln.Close()
 	fmt.Println("closed listener")
 
+	clients := make(map[*Client]bool)
 	s.mu.Lock()
-	clients := append([]net.Conn(nil), s.clients...)
+	maps.Copy(clients, s.clients)
 	s.mu.Unlock()
-	for _, c := range clients {
-		_ = c.Close()
+	for c := range clients {
+		c.conn.Close()
 	}
 	fmt.Println("closed all connections")
 
@@ -133,4 +144,23 @@ func (s *Server) shutdownWatcher() {
 // (accept loop exited and all connection goroutines are done).
 func (s *Server) Done() <-chan struct{} {
 	return s.done
+}
+
+type Client struct {
+	conn net.Conn
+	send chan []byte
+}
+
+func (c *Client) write() {
+	for msg := range c.send {
+		if _, err := c.conn.Write(msg); err != nil {
+			fmt.Println("failed to write data, err:", err)
+			return
+		}
+	}
+}
+
+func (c *Client) close() {
+	_ = c.conn.Close()
+	close(c.send)
 }
