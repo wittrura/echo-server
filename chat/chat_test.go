@@ -233,3 +233,87 @@ func TestChatServer_DisconnectedClientIsRemovedCleanly(t *testing.T) {
 		t.Fatalf("c2 expected %q, got %q", "ping\n", resp)
 	}
 }
+
+func TestChatServer_NickCommandPrefixesMessages(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	// Two clients: c1 will set a nick and send, c2 will observe.
+	c1 := dialChat(t, addr.String(), 2*time.Second)
+	defer c1.Close()
+	c2 := dialChat(t, addr.String(), 2*time.Second)
+	defer c2.Close()
+
+	r2 := bufio.NewReader(c2)
+
+	// c1 sets nickname.
+	if _, err := c1.Write([]byte("/nick alice\n")); err != nil {
+		t.Fatalf("client1 failed to write /nick: %v", err)
+	}
+
+	// We do not expect /nick itself to be broadcast, so we don't read here.
+
+	// c1 sends a normal chat line.
+	if _, err := c1.Write([]byte("hello there\n")); err != nil {
+		t.Fatalf("client1 failed to write chat line: %v", err)
+	}
+
+	// c2 should see the nick-prefixed message.
+	resp, err := r2.ReadString('\n')
+	if err != nil {
+		t.Fatalf("client2 failed to read nick-prefixed message: %v", err)
+	}
+	expected := "alice: hello there\n"
+	if resp != expected {
+		t.Fatalf("client2 expected %q, got %q", expected, resp)
+	}
+}
+
+func TestChatServer_QuitClosesClientButKeepsOthersAlive(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	// Two clients.
+	c1 := dialChat(t, addr.String(), 2*time.Second)
+	c2 := dialChat(t, addr.String(), 2*time.Second)
+	defer c2.Close()
+
+	r2 := bufio.NewReader(c2)
+
+	// c1 issues /quit.
+	if _, err := c1.Write([]byte("/quit\n")); err != nil {
+		t.Fatalf("client1 failed to write /quit: %v", err)
+	}
+
+	// c1's connection should be closed shortly.
+	c1.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	_, err = bufio.NewReader(c1).ReadByte()
+	if err == nil {
+		t.Fatalf("expected client1 connection to be closed after /quit, but read succeeded")
+	}
+	_ = c1.Close() // ensure it's closed on our side too
+
+	// c2 should still be able to send and receive messages without panic.
+	msg := "still-here\n"
+	if _, err := c2.Write([]byte(msg)); err != nil {
+		t.Fatalf("client2 failed to write after client1 quit: %v", err)
+	}
+
+	resp, err := r2.ReadString('\n')
+	if err != nil {
+		t.Fatalf("client2 failed to read its own broadcast after client1 quit: %v", err)
+	}
+	if resp != msg {
+		t.Fatalf("client2 expected %q, got %q", msg, resp)
+	}
+}

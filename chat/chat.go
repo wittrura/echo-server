@@ -8,6 +8,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"strings"
 	"sync"
 )
 
@@ -94,23 +95,32 @@ func (s *Server) handleClient(c *Client, wg *sync.WaitGroup) error {
 	for {
 		msg, err := reader.ReadBytes(byte('\n'))
 		if err != nil {
-			if err != io.EOF {
-				fmt.Println("failed to read data, err:", err)
+			if errors.Is(err, io.EOF) {
+				return nil
 			}
 			if ne, ok := err.(*net.OpError); ok && ne.Err.Error() == "use of closed network connection" {
 				return nil
 			}
 
+			fmt.Println("failed to read data, err:", err)
 			return err
 		}
 
-		clients := make(map[*Client]bool)
-		s.mu.Lock()
-		maps.Copy(clients, s.clients)
-		s.mu.Unlock()
+		raw := string(msg)
+		if after, ok := strings.CutPrefix(raw, "/nick "); ok {
+			name := strings.TrimSpace(after)
+			c.name = name
+			continue
+		}
+
+		if strings.TrimSpace(raw) == "/quit" {
+			return nil
+		}
+
+		clients := s.copyClients()
 		for client := range clients {
 			select {
-			case client.send <- msg:
+			case client.send <- c.message(raw):
 			default:
 			}
 		}
@@ -124,10 +134,7 @@ func (s *Server) shutdownWatcher() {
 	_ = s.ln.Close()
 	fmt.Println("closed listener")
 
-	clients := make(map[*Client]bool)
-	s.mu.Lock()
-	maps.Copy(clients, s.clients)
-	s.mu.Unlock()
+	clients := s.copyClients()
 	for c := range clients {
 		c.conn.Close()
 	}
@@ -140,6 +147,14 @@ func (s *Server) shutdownWatcher() {
 	fmt.Println("closed done channel to notify client")
 }
 
+func (s *Server) copyClients() map[*Client]bool {
+	clients := make(map[*Client]bool)
+	s.mu.Lock()
+	maps.Copy(clients, s.clients)
+	s.mu.Unlock()
+	return clients
+}
+
 // Done returns a channel that is closed when the server has fully shut down
 // (accept loop exited and all connection goroutines are done).
 func (s *Server) Done() <-chan struct{} {
@@ -149,6 +164,8 @@ func (s *Server) Done() <-chan struct{} {
 type Client struct {
 	conn net.Conn
 	send chan []byte
+
+	name string
 }
 
 func (c *Client) write() {
@@ -163,4 +180,11 @@ func (c *Client) write() {
 func (c *Client) close() {
 	_ = c.conn.Close()
 	close(c.send)
+}
+
+func (c *Client) message(s string) []byte {
+	if c.name != "" {
+		s = fmt.Sprintf("%s: %s", c.name, s)
+	}
+	return []byte(s)
 }
