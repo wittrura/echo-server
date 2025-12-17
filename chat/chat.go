@@ -132,7 +132,7 @@ func (s *Server) handleClient(c *Client, wg *sync.WaitGroup) error {
 		clients := s.copyClients()
 		var peers []*Client
 		for client := range clients {
-			if client.room == c.room {
+			if client.room == c.room && client != c {
 				peers = append(peers, client)
 			}
 		}

@@ -58,14 +58,13 @@ func TestChatServer_BroadcastsMessageToOtherClient(t *testing.T) {
 		t.Fatalf("client2 expected %q, got %q", msg, resp)
 	}
 
-	// Client 1 should receive that line.
-	resp, err = r1.ReadString('\n')
-	if err != nil {
-		t.Fatalf("client1 failed to read broadcast: %v", err)
+	// Sender should NOT receive its own message.
+	_ = c1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err = r1.ReadString('\n')
+	if err == nil {
+		t.Fatalf("expected client1 to NOT receive its own message, but read succeeded")
 	}
-	if resp != msg {
-		t.Fatalf("client1 expected %q, got %q", msg, resp)
-	}
+	_ = c1.SetReadDeadline(time.Time{})
 
 	// Client 2 sends a message.
 	msg = "hello-from-c2\n"
@@ -80,15 +79,6 @@ func TestChatServer_BroadcastsMessageToOtherClient(t *testing.T) {
 	}
 	if resp != msg {
 		t.Fatalf("client1 expected %q, got %q", msg, resp)
-	}
-
-	// Client 2 should receive that line.
-	resp, err = r2.ReadString('\n')
-	if err != nil {
-		t.Fatalf("client2 failed to read broadcast: %v", err)
-	}
-	if resp != msg {
-		t.Fatalf("client2 expected %q, got %q", msg, resp)
 	}
 
 	// Shutdown server so goroutines can exit cleanly.
@@ -215,7 +205,11 @@ func TestChatServer_DisconnectedClientIsRemovedCleanly(t *testing.T) {
 
 	c2 := dialChat(t, addr.String(), 1*time.Second)
 	defer c2.Close()
-	r2 := bufio.NewReader(c2)
+
+	// c3 will act as the receiver (sender should not receive its own broadcast).
+	c3 := dialChat(t, addr.String(), 1*time.Second)
+	defer c3.Close()
+	r3 := bufio.NewReader(c3)
 
 	// Close c1 to simulate a client dropping
 	_ = c1.Close()
@@ -225,12 +219,12 @@ func TestChatServer_DisconnectedClientIsRemovedCleanly(t *testing.T) {
 		t.Fatalf("c2 write failed: %v", err)
 	}
 
-	resp, err := r2.ReadString('\n')
+	resp, err := r3.ReadString('\n')
 	if err != nil {
-		t.Fatalf("c2 failed to read: %v", err)
+		t.Fatalf("c3 failed to read: %v", err)
 	}
 	if resp != "ping\n" {
-		t.Fatalf("c2 expected %q, got %q", "ping\n", resp)
+		t.Fatalf("c3 expected %q, got %q", "ping\n", resp)
 	}
 }
 
@@ -288,7 +282,10 @@ func TestChatServer_QuitClosesClientButKeepsOthersAlive(t *testing.T) {
 	c2 := dialChat(t, addr.String(), 2*time.Second)
 	defer c2.Close()
 
-	r2 := bufio.NewReader(c2)
+	// c3 as receiver
+	c3 := dialChat(t, addr.String(), 2*time.Second)
+	defer c3.Close()
+	r3 := bufio.NewReader(c3)
 
 	// c1 issues /quit.
 	if _, err := c1.Write([]byte("/quit\n")); err != nil {
@@ -309,12 +306,12 @@ func TestChatServer_QuitClosesClientButKeepsOthersAlive(t *testing.T) {
 		t.Fatalf("client2 failed to write after client1 quit: %v", err)
 	}
 
-	resp, err := r2.ReadString('\n')
+	resp, err := r3.ReadString('\n')
 	if err != nil {
-		t.Fatalf("client2 failed to read its own broadcast after client1 quit: %v", err)
+		t.Fatalf("client3 failed to read broadcast after client1 quit: %v", err)
 	}
 	if resp != msg {
-		t.Fatalf("client2 expected %q, got %q", msg, resp)
+		t.Fatalf("client3 expected %q, got %q", msg, resp)
 	}
 }
 
@@ -359,17 +356,6 @@ func TestChatServer_JoinMovesClientAndBroadcastIsRoomScoped(t *testing.T) {
 		t.Fatalf("c1 failed to write: %v", err)
 	}
 
-	// Current implementation broadcasts to the sender as well; drain c1's own lobby message
-	// so it doesn't interfere with the later "should not receive" assertion.
-	r1 := bufio.NewReader(c1)
-	got1, err := r1.ReadString('\n')
-	if err != nil {
-		t.Fatalf("c1 failed to read its own lobby broadcast: %v", err)
-	}
-	if got1 != msg {
-		t.Fatalf("c1 expected %q, got %q", msg, got1)
-	}
-
 	// c2 should receive it (still in lobby)
 	got2, err := r2.ReadString('\n')
 	if err != nil {
@@ -394,6 +380,7 @@ func TestChatServer_JoinMovesClientAndBroadcastIsRoomScoped(t *testing.T) {
 	}
 
 	// c1 should NOT receive blue messages
+	r1 := bufio.NewReader(c1)
 	_ = c1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	_, err = r1.ReadString('\n')
 	if err == nil {
