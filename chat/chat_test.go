@@ -317,3 +317,86 @@ func TestChatServer_QuitClosesClientButKeepsOthersAlive(t *testing.T) {
 		t.Fatalf("client2 expected %q, got %q", msg, resp)
 	}
 }
+
+func TestChatServer_JoinMovesClientAndBroadcastIsRoomScoped(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	// c1 + c2 start in lobby
+	c1 := dialChat(t, addr.String(), 2*time.Second)
+	defer c1.Close()
+	c2 := dialChat(t, addr.String(), 2*time.Second)
+	defer c2.Close()
+	r2 := bufio.NewReader(c2)
+
+	// c3 will join a different room
+	c3 := dialChat(t, addr.String(), 2*time.Second)
+	defer c3.Close()
+	r3 := bufio.NewReader(c3)
+
+	// Move c3 to room "blue"
+	if _, err := c3.Write([]byte("/join blue\n")); err != nil {
+		t.Fatalf("c3 failed to write /join: %v", err)
+	}
+
+	// Wait for server to process /join so the test isn't racy.
+	ack, err := r3.ReadString('\n')
+	if err != nil {
+		t.Fatalf("c3 failed to read join ack: %v", err)
+	}
+	if ack != "joined blue\n" {
+		t.Fatalf("expected join ack %q, got %q", "joined blue\n", ack)
+	}
+
+	// c1 sends a lobby message
+	msg := "hello-lobby\n"
+	if _, err := c1.Write([]byte(msg)); err != nil {
+		t.Fatalf("c1 failed to write: %v", err)
+	}
+
+	// Current implementation broadcasts to the sender as well; drain c1's own lobby message
+	// so it doesn't interfere with the later "should not receive" assertion.
+	r1 := bufio.NewReader(c1)
+	got1, err := r1.ReadString('\n')
+	if err != nil {
+		t.Fatalf("c1 failed to read its own lobby broadcast: %v", err)
+	}
+	if got1 != msg {
+		t.Fatalf("c1 expected %q, got %q", msg, got1)
+	}
+
+	// c2 should receive it (still in lobby)
+	got2, err := r2.ReadString('\n')
+	if err != nil {
+		t.Fatalf("c2 failed to read lobby broadcast: %v", err)
+	}
+	if got2 != msg {
+		t.Fatalf("c2 expected %q, got %q", msg, got2)
+	}
+
+	// c3 should NOT receive lobby messages (deadline to prove absence)
+	_ = c3.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err = r3.ReadString('\n')
+	if err == nil {
+		t.Fatalf("expected c3 to NOT receive lobby message after joining blue, but read succeeded")
+	}
+
+	// Now c3 sends in blue
+	msgBlue := "hello-blue\n"
+	_ = c3.SetReadDeadline(time.Time{}) // clear deadline
+	if _, err := c3.Write([]byte(msgBlue)); err != nil {
+		t.Fatalf("c3 failed to write: %v", err)
+	}
+
+	// c1 should NOT receive blue messages
+	_ = c1.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, err = r1.ReadString('\n')
+	if err == nil {
+		t.Fatalf("expected c1 to NOT receive blue message, but read succeeded")
+	}
+}

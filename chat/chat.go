@@ -64,7 +64,7 @@ func (s *Server) acceptLoop() {
 		}
 
 		s.mu.Lock()
-		c := &Client{conn: conn, send: make(chan []byte)}
+		c := newClient(conn)
 		s.clients[c] = true
 		s.mu.Unlock()
 
@@ -112,15 +112,38 @@ func (s *Server) handleClient(c *Client, wg *sync.WaitGroup) error {
 			c.name = name
 			continue
 		}
+		if after, ok := strings.CutPrefix(raw, "/join "); ok {
+			room := strings.TrimSpace(after)
+			c.room = room
 
+			// Ack to allow clients/tests to know the server processed the join.
+			ack := fmt.Appendf(nil, "joined %s\n", room)
+			select {
+			case c.send <- ack:
+			default:
+			}
+
+			continue
+		}
 		if strings.TrimSpace(raw) == "/quit" {
 			return nil
 		}
 
 		clients := s.copyClients()
+		var peers []*Client
 		for client := range clients {
+			if client.room == c.room {
+				peers = append(peers, client)
+			}
+		}
+
+		if c.name != "" {
+			msg = fmt.Appendf(nil, "%s: %s", c.name, raw)
+		}
+
+		for _, client := range peers {
 			select {
-			case client.send <- c.message(raw):
+			case client.send <- msg:
 			default:
 			}
 		}
@@ -165,7 +188,18 @@ type Client struct {
 	conn net.Conn
 	send chan []byte
 
+	mu sync.Mutex
+
 	name string
+	room string
+}
+
+func newClient(conn net.Conn) *Client {
+	return &Client{
+		conn: conn,
+		send: make(chan []byte),
+		room: "lobby",
+	}
 }
 
 func (c *Client) write() {
@@ -180,11 +214,4 @@ func (c *Client) write() {
 func (c *Client) close() {
 	_ = c.conn.Close()
 	close(c.send)
-}
-
-func (c *Client) message(s string) []byte {
-	if c.name != "" {
-		s = fmt.Sprintf("%s: %s", c.name, s)
-	}
-	return []byte(s)
 }
