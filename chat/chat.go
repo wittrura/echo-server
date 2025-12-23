@@ -2,6 +2,7 @@ package chat
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -93,8 +95,12 @@ func (s *Server) handleClient(c *Client, wg *sync.WaitGroup) error {
 	reader := bufio.NewReader(c.conn)
 
 	for {
-		msg, err := reader.ReadBytes(byte('\n'))
+		msg, err := readLineWithStallTimeout(reader, c.conn, 250*time.Millisecond)
 		if err != nil {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				return nil
+			}
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -188,8 +194,6 @@ type Client struct {
 	conn net.Conn
 	send chan []byte
 
-	mu sync.Mutex
-
 	name string
 	room string
 }
@@ -214,4 +218,63 @@ func (c *Client) write() {
 func (c *Client) close() {
 	_ = c.conn.Close()
 	close(c.send)
+}
+
+// readLineWithStallTimeout reads one '\n'-terminated line.
+//   - A totally silent client can wait forever (no deadline until first byte).
+//   - Once a line starts (at least 1 byte available), the client must finish
+//     the line within stallTimeout or we return a timeout error.
+func readLineWithStallTimeout(r *bufio.Reader, conn net.Conn, stallTimeout time.Duration) ([]byte, error) {
+	_ = conn.SetReadDeadline(time.Time{}) // clear any prior read deadline
+	if _, err := r.Peek(1); err != nil {
+		return nil, err // EOF, closed connection
+	}
+
+	// client sent at least one byte, now we can enforce line completion timeout
+	deadline := func() error {
+		return conn.SetReadDeadline(time.Now().Add(stallTimeout))
+	}
+	if err := deadline(); err != nil {
+		return nil, err
+	}
+
+	// read until '\n', collecting fragments when the buffer fills.
+	var fullBuffers [][]byte
+	var totalLen int
+	for {
+		frag, err := r.ReadSlice('\n')
+		if err == nil { // got final fragment
+			_ = deadline()
+
+			totalLen += len(frag)
+
+			// Build the final line with minimal copies.
+			// If no overflow fragments, return frag directly.
+			if len(fullBuffers) == 0 {
+				return frag, nil
+			}
+
+			out := make([]byte, 0, totalLen)
+			for _, b := range fullBuffers {
+				out = append(out, b...)
+			}
+			out = append(out, frag...)
+			return out, nil
+		}
+
+		if err == bufio.ErrBufferFull {
+			// Buffer filled before finding '\n'. This counts as progress.
+			// Refresh the deadline because the client is sending data.
+			_ = deadline()
+
+			// Copy frag because ReadSlice's returned slice points into the reader's buffer.
+			buf := bytes.Clone(frag)
+			fullBuffers = append(fullBuffers, buf)
+			totalLen += len(buf)
+			continue
+		}
+
+		// Any other error includes timeout, EOF, etc.
+		return nil, err
+	}
 }

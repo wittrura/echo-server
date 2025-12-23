@@ -2,8 +2,10 @@ package chat_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -385,5 +387,149 @@ func TestChatServer_JoinMovesClientAndBroadcastIsRoomScoped(t *testing.T) {
 	_, err = r1.ReadString('\n')
 	if err == nil {
 		t.Fatalf("expected c1 to NOT receive blue message, but read succeeded")
+	}
+}
+
+// NOTE: There is a known send/close race during teardown.
+// This will be resolved by the planned single-broadcaster refactor.
+func TestChatServer_ActiveClientIsNotDisconnectedByIdleTimeout(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	sender := dialChat(t, addr.String(), 1*time.Second)
+	defer sender.Close()
+
+	recv := dialChat(t, addr.String(), 1*time.Second)
+	defer recv.Close()
+	r := bufio.NewReader(recv)
+
+	for range 3 {
+		if _, err := sender.Write([]byte("ping\n")); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		if _, err := r.ReadString('\n'); err != nil {
+			t.Fatalf("read failed: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestChatServer_IdleClientDoesNotAffectOthers(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	// A a completely silent client should NOT be disconnected.
+	// Only clients that start a line and then stall should time out.
+	idle := dialChat(t, addr.String(), 1*time.Second)
+	defer idle.Close()
+
+	sender := dialChat(t, addr.String(), 1*time.Second)
+	defer sender.Close()
+
+	recv := dialChat(t, addr.String(), 1*time.Second)
+	defer recv.Close()
+	r := bufio.NewReader(recv)
+
+	// Let time pass longer than the server's current (hardcoded) timeout.
+	// The idle client should remain connected, and active clients should still work.
+	time.Sleep(300 * time.Millisecond)
+
+	msg := "still-alive\n"
+	if _, err := sender.Write([]byte(msg)); err != nil {
+		t.Fatalf("sender write failed: %v", err)
+	}
+	resp, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("receiver read failed: %v", err)
+	}
+	if resp != msg {
+		t.Fatalf("expected %q, got %q", msg, resp)
+	}
+}
+
+func TestChatServer_PartialLineStallIsDisconnected(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	// You may hardcode the line-completion timeout internally for now (e.g. 200–250ms)
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	c := dialChat(t, addr.String(), 1*time.Second)
+	defer c.Close()
+
+	// Start a line but do not complete it. This should trigger the slowloris defense.
+	if _, err := c.Write([]byte("partial")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	// We expect the server to close the connection after the line-completion timeout.
+	c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, err = bufio.NewReader(c).ReadByte()
+	if err == nil {
+		t.Fatalf("expected partial-line client to be disconnected, but read succeeded")
+	}
+}
+
+func TestChatServer_LongLineTriggersBufferFullFragmentPath(t *testing.T) {
+	ctx := t.Context()
+
+	srv := NewServer("127.0.0.1:0")
+	addr, err := srv.Start(ctx)
+	if err != nil {
+		t.Fatalf("failed to start chat server: %v", err)
+	}
+
+	// Sender and receiver (sender does not receive its own messages).
+	sender := dialChat(t, addr.String(), 2*time.Second)
+	defer sender.Close()
+
+	recv := dialChat(t, addr.String(), 2*time.Second)
+	defer recv.Close()
+	r := bufio.NewReader(recv)
+
+	// bufio.NewReader defaults to a 4096-byte buffer.
+	// Make a line longer than that so server-side ReadSlice('\n') hits ErrBufferFull.
+	payloadLen := 5000
+	payload := bytes.Repeat([]byte("a"), payloadLen)
+	msgBytes := append(payload, '\n')
+
+	if len(msgBytes) <= 4096 {
+		t.Fatalf("test requires msg > 4096 bytes, got %d", len(msgBytes))
+	}
+
+	if _, err := sender.Write(msgBytes); err != nil {
+		t.Fatalf("sender write failed: %v", err)
+	}
+
+	// Receiver should get the full line, untruncated.
+	_ = recv.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("receiver read failed: %v", err)
+	}
+
+	expected := string(msgBytes)
+	if got != expected {
+		// Make failures readable if something truncates.
+		if len(got) != len(expected) {
+			t.Fatalf("expected %d bytes, got %d bytes", len(expected), len(got))
+		}
+		if !strings.HasSuffix(got, "\n") {
+			t.Fatalf("expected newline-terminated message")
+		}
+		t.Fatalf("expected payload to match exactly")
 	}
 }
